@@ -9,10 +9,26 @@ import { createShakeDetector } from './shake.js';
 import { startMotion } from './sensor.js';
 
 const tg = window.Telegram?.WebApp;
-tg?.ready();
-tg?.expand();
+const debugEl = document.getElementById('debug');
+const SHOW_DEBUG = !location.search.includes('debug=0');   // скрыть: добавь ?debug=0 к URL
 
-// Простая оценка мощности; можно заменить на computeTier из прошлого ответа
+// ---------- Telegram: полный экран ----------
+function goFullscreen() {
+  if (!tg) return;
+  try {
+    if (tg.isVersionAtLeast('8.0') && !tg.isFullscreen) tg.requestFullscreen();
+  } catch (e) { fsError = e.message; }
+}
+let fsError = '';
+if (tg) {
+  tg.ready();
+  tg.expand();
+  try { if (tg.isVersionAtLeast('7.7')) tg.disableVerticalSwipes(); } catch {}   // чтобы тряска/свайп не закрывали окно
+  goFullscreen();
+  tg.onEvent?.('fullscreenFailed', (e) => { fsError = e?.error || 'failed'; });
+}
+
+// ---------- Сцена ----------
 const lowEnd = (navigator.hardwareConcurrency || 4) <= 4;
 const view = createScene(document.getElementById('c'), {
   dpr: lowEnd ? 1 : Math.min(window.devicePixelRatio || 1, 2),
@@ -59,7 +75,6 @@ async function roll(strength) {
     return;
   }
 
-  // Подгоняем числа на гранях ДО старта анимации
   dice.forEach((m, i) => setLabels(m, computeLabels(sim.tops[i], values[i])));
 
   const t0 = performance.now();
@@ -68,7 +83,7 @@ async function roll(strength) {
     const t = Math.max(0, (now - t0) / 1000);
     const going = poseAt(sim, dice, t);
 
-    const curStep = t * CONFIG.STEP_HZ;            // тактильный отклик на удары
+    const curStep = t * CONFIG.STEP_HZ;
     while (impactIdx < sim.impacts.length && sim.impacts[impactIdx].step <= curStep) {
       const { v } = sim.impacts[impactIdx++];
       if (now - lastHaptic > 60) {
@@ -89,17 +104,41 @@ async function roll(strength) {
   requestAnimationFrame(frame);
 }
 
+// ---------- Датчики ----------
+let source = 'не запущен';
+let statusMsg = '';
 const feed = createShakeDetector((strength) => roll(strength));
-let motionStarted = false;
-document.getElementById('rollBtn').addEventListener('click', () => {
-  if (!motionStarted) { motionStarted = true; startMotion(feed); }   // жест пользователя нужен iOS
-  roll(0.4 + Math.random() * 0.5);
-});
+let samples = 0;
+const countedFeed = (x, y, z) => { samples++; feed(x, y, z); };
+
+let motionStarting = false;
+async function ensureMotion() {                    // безопасно вызывать много раз
+  if (motionStarting) return;
+  motionStarting = true;
+  source = (await startMotion(countedFeed, (s) => { statusMsg = s; })) || 'нет';
+}
+ensureMotion();                                    // Telegram-акселерометр стартует без жеста
+window.addEventListener('pointerdown', () => { goFullscreen(); ensureMotion(); }, { once: true });
+// ^ первое касание в любом месте: повторный запрос полного экрана и запуск датчика (нужно для iOS)
+
+// ---------- Кнопки ----------
+document.getElementById('rollBtn').addEventListener('click', () => roll(0.4 + Math.random() * 0.5));
 document.getElementById('plus').addEventListener('click', () => {
   if (!rolling && count < CONFIG.MAX_DICE) { count++; rebuildDice(); }
 });
 document.getElementById('minus').addEventListener('click', () => {
   if (!rolling && count > 1) { count--; rebuildDice(); }
 });
+
+// ---------- Диагностика ----------
+if (SHOW_DEBUG) {
+  setInterval(() => {
+    const s = feed.stats;
+    debugEl.textContent =
+      `tg ${tg?.version ?? '-'} ${tg?.platform ?? '-'} fullscreen=${tg?.isFullscreen ?? '-'} ${fsError}\n` +
+      `sensor=${source} samples=${samples} ${statusMsg}\n` +
+      `|a|=${s.mag.toFixed(1)} dev=${s.dev.toFixed(1)} peak=${s.peak.toFixed(1)} shakes=${s.shakes}`;
+  }, 250);
+}
 
 rebuildDice();
