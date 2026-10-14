@@ -1,0 +1,31 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no, viewport-fit=cover">
+  <script src="https://telegram.org/js/telegram-web-app.js"></script>
+  <link rel="stylesheet" href="style.css">
+  <script type="importmap">
+  {
+    "imports": {
+      "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+      "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/",
+      "cannon-es": "https://cdn.jsdelivr.net/npm/cannon-es@0.20.0/dist/cannon-es.js"
+    }
+  }
+  </script>
+</head>
+<body>
+  <canvas id="c"></canvas>
+  <div id="ui">
+    <div id="result">Потряси телефон</div>
+    <div id="controls">
+      <button id="minus">−</button>
+      <span id="count">2</span>
+      <button id="plus">+</button>
+      <button id="rollBtn">Бросить</button>
+    </div>
+  </div>
+  <script type="module" src="main.js"></script>
+</body>
+</html>
