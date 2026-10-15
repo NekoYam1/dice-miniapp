@@ -29,7 +29,8 @@ if (tg) {
 }
 
 // ---------- Сцена ----------
-const lowEnd = (navigator.hardwareConcurrency || 4) <= 4;
+const isIOS = tg?.platform === 'ios';                 // iOS-устройства не считаем слабыми: hardwareConcurrency там занижен
+const lowEnd = !isIOS && (navigator.hardwareConcurrency || 4) <= 4;
 const view = createScene(document.getElementById('c'), {
   dpr: lowEnd ? 1 : Math.min(window.devicePixelRatio || 1, 2),
   shadows: !lowEnd,

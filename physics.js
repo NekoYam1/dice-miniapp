@@ -45,8 +45,8 @@ function makeDie(dieMat, i, n, strength) {
   body.position.set((i - (n - 1) / 2) * dx, 1.8 + i * 1.05, ARENA.halfZ - 1 + rnd(-0.15, 0.15));
   body.quaternion.setFromEuler(0, rnd(0, Math.PI * 2), 0);
 
-  // strength 0..1. Пример 0.5: скорость 9.5 ед/с, вращение до ±19 рад/с по каждой оси
-  const speed = 5 + 9 * strength;
+  // strength 0..1. Пример 0.5: скорость 6 ед/с, вращение до ±19 рад/с по каждой оси
+  const speed = 3 + 6 * strength;
   const spin = 8 + 22 * strength;
   body.velocity.set(rnd(-1.5, 1.5), rnd(-1, 0.5), -speed + rnd(-1, 1));   // к дальней стене
   body.angularVelocity.set(rnd(-spin, spin), rnd(-spin, spin), rnd(-spin, spin));

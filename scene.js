@@ -53,11 +53,11 @@ export function createScene(canvas, quality) {
     camera.aspect = w / h;
     // Подбираем дистанцию, чтобы стол целиком влезал и в портрете, и в ландшафте
     const vTan = Math.tan(THREE.MathUtils.degToRad(camera.fov / 2));
-    const needW = halfX * 2 + 1.4, needH = halfZ * 2 + 1.4;
+    const needW = halfX * 2 + 1.4, needH = halfZ * 2 + 3.0;
     const dist = Math.max(needH / (2 * vTan), needW / (2 * vTan * camera.aspect));
     const elev = THREE.MathUtils.degToRad(68);
     camera.position.set(0, dist * Math.sin(elev), dist * Math.cos(elev));
-    camera.lookAt(0, 0, 0.8);              // сдвиг вверх: нижнюю часть закрывает панель кнопок
+    camera.lookAt(0, 0, 0.3);              // небольшой сдвиг: нижнюю часть закрывает панель кнопок
     camera.updateProjectionMatrix();
   }
   resize();
