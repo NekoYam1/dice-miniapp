@@ -1,35 +1,39 @@
 import { CONFIG } from './config.js';
 import { createScene } from './scene.js';
 import { createDie, setLabels } from './dieMesh.js';
-import { simulateThrow } from './physics.js';
+import { createLiveWorld } from './world.js';
+import { forecastRoll } from './forecast.js';
 import { computeLabels, STANDARD } from './relabel.js';
-import { poseAt } from './playback.js';
+import { poseAt, finalPose } from './playback.js';
 import { requestRoll } from './api.js';
-import { createShakeDetector } from './shake.js';
+import { createMotion } from './motion.js';
+import { createShakeTracker } from './shake.js';
 import { startMotion } from './sensor.js';
 
 const tg = window.Telegram?.WebApp;
 const debugEl = document.getElementById('debug');
-const SHOW_DEBUG = !location.search.includes('debug=0');   // скрыть: добавь ?debug=0 к URL
+const params = new URLSearchParams(location.search);
+const SHOW_DEBUG = params.get('debug') !== '0';                 // скрыть диагностику: ?debug=0
+const FLIP = params.get('flip') === null ? null : params.get('flip') === '1';   // ?flip=1 / ?flip=0 — знак осей вручную
 
 // ---------- Telegram: полный экран ----------
+let fsError = '';
 function goFullscreen() {
   if (!tg) return;
   try {
     if (tg.isVersionAtLeast('8.0') && !tg.isFullscreen) tg.requestFullscreen();
   } catch (e) { fsError = e.message; }
 }
-let fsError = '';
 if (tg) {
   tg.ready();
   tg.expand();
-  try { if (tg.isVersionAtLeast('7.7')) tg.disableVerticalSwipes(); } catch {}   // чтобы тряска/свайп не закрывали окно
+  try { if (tg.isVersionAtLeast('7.7')) tg.disableVerticalSwipes(); } catch {}   // тряска не должна закрывать окно
   goFullscreen();
   tg.onEvent?.('fullscreenFailed', (e) => { fsError = e?.error || 'failed'; });
 }
 
 // ---------- Сцена ----------
-const isIOS = tg?.platform === 'ios';                 // iOS-устройства не считаем слабыми: hardwareConcurrency там занижен
+const isIOS = tg?.platform === 'ios';                 // iOS не считаем слабым: hardwareConcurrency там занижен
 const lowEnd = !isIOS && (navigator.hardwareConcurrency || 4) <= 4;
 const view = createScene(document.getElementById('c'), {
   dpr: lowEnd ? 1 : Math.min(window.devicePixelRatio || 1, 2),
@@ -39,107 +43,174 @@ const view = createScene(document.getElementById('c'), {
 
 const resultEl = document.getElementById('result');
 const countEl = document.getElementById('count');
+
+// ---------- Вибрация от ударов ----------
+let lastHaptic = 0;
+function haptic(v) {
+  const now = performance.now();
+  if (now - lastHaptic < CONFIG.LIVE.HAPTIC_GAP_MS) return;
+  lastHaptic = now;
+  tg?.HapticFeedback?.impactOccurred(v > 10 ? 'heavy' : v > 5 ? 'medium' : 'light');
+}
+
+// ---------- Кости: живой мир + меши ----------
 let count = 2;
 let dice = [];
-let rolling = false;
-let lastHaptic = 0;
+let world = null;
 
-function rebuildDice() {
+function syncMeshes() {
+  world.bodies.forEach((b, i) => {
+    dice[i].position.copy(b.interpolatedPosition);
+    dice[i].quaternion.copy(b.interpolatedQuaternion);
+  });
+}
+
+function rebuild() {
   dice.forEach(d => view.scene.remove(d));
-  const { halfX } = CONFIG.ARENA;
-  const dx = count > 1 ? Math.min(1.25, (2 * halfX - 1.2) / (count - 1)) : 0;
-  dice = Array.from({ length: count }, (_, i) => {
+  world = createLiveWorld(count, haptic);
+  dice = Array.from({ length: count }, () => {
     const m = createDie();
     setLabels(m, STANDARD);
-    m.position.set((i - (count - 1) / 2) * dx, 0.5, 0);
-    m.rotation.set(0, i * 0.4, 0);
     view.scene.add(m);
     return m;
   });
+  syncMeshes();
   countEl.textContent = count;
   view.render();
 }
 
-async function roll(strength) {
-  if (rolling) return;
-  rolling = true;
-  resultEl.textContent = '';
+// ---------- Состояние: live (поднос) -> rolling (проигрыш записанного броска) -> live ----------
+let mode = 'live';
+let playback = null;
+let pendingRoll = null;        // значения запрашиваем в начале тряски, к броску они уже готовы
 
-  const valuesPromise = requestRoll(count);        // значения: RNG или сервер, идут параллельно
-  const sim = simulateThrow(count, strength);      // физика заранее, ~20-60 мс
-  let values;
+const motion = createMotion({ flip: FLIP });
+const tracker = createShakeTracker({ onStart: handleStart, onRelease: handleRelease });
+
+function handleStart() {
+  pendingRoll = requestRoll(count);
+  pendingRoll.catch(() => {});                  // ошибку обработаем при броске
+  resultEl.textContent = '...';
+}
+
+async function handleRelease() {
+  if (mode !== 'live') return;
+  mode = 'rolling';
+  playback = null;
+
+  let sim;
   try {
-    values = await valuesPromise;
-  } catch {
-    resultEl.textContent = 'Ошибка сети';
-    rolling = false;
+    sim = forecastRoll(world.snapshot());       // 20-60 мс: весь полёт считается заранее
+  } catch (e) {
+    console.error(e);
+    resultEl.textContent = 'Ошибка физики';
+    mode = 'live';
     return;
   }
 
-  dice.forEach((m, i) => setLabels(m, computeLabels(sim.tops[i], values[i])));
+  let values;
+  try {
+    values = await (pendingRoll ?? requestRoll(count));
+  } catch {
+    resultEl.textContent = 'Ошибка сети';
+    pendingRoll = null;
+    mode = 'live';                              // мир не менялся, продолжаем с того же места
+    return;
+  }
+  pendingRoll = null;
 
-  const t0 = performance.now();
-  let impactIdx = 0;
-  function frame(now) {
-    const t = Math.max(0, (now - t0) / 1000);
-    const going = poseAt(sim, dice, t);
+  // Какие числа на какой грани — решаем сейчас, но покажем их, когда кость в воздухе
+  const labels = dice.map((_, i) => computeLabels(sim.tops[i], values[i]));
+  playback = {
+    sim, values, labels,
+    swapped: dice.map(() => false),
+    impactIdx: 0,
+    t0: performance.now(),
+  };
+}
 
-    const curStep = t * CONFIG.STEP_HZ;
-    while (impactIdx < sim.impacts.length && sim.impacts[impactIdx].step <= curStep) {
-      const { v } = sim.impacts[impactIdx++];
-      if (now - lastHaptic > 60) {
-        tg?.HapticFeedback?.impactOccurred(v > 8 ? 'medium' : 'light');
-        lastHaptic = now;
-      }
-    }
+function playbackFrame(now) {
+  if (!playback) return;                        // ждём значения (сервер)
+  const { sim, labels, swapped } = playback;
+  const t = Math.max(0, (now - playback.t0) / 1000);
+  const going = poseAt(sim, dice, t);
+  const step = t * CONFIG.STEP_HZ;
 
-    view.render();
-    if (going) {
-      requestAnimationFrame(frame);
-    } else {
-      const sum = values.reduce((a, b) => a + b, 0);
-      resultEl.textContent = count > 1 ? `${values.join(' + ')} = ${sum}` : `${values[0]}`;
-      rolling = false;
+  for (let i = 0; i < dice.length; i++) {       // подмена чисел в воздухе
+    if (!swapped[i] && step >= sim.swapSteps[i]) {
+      setLabels(dice[i], labels[i]);
+      swapped[i] = true;
     }
   }
+  while (playback.impactIdx < sim.impacts.length && sim.impacts[playback.impactIdx].step <= step) {
+    haptic(sim.impacts[playback.impactIdx++].v);
+  }
+  if (!going) finishRoll();
+}
+
+function finishRoll() {
+  const { sim, values, labels, swapped } = playback;
+  dice.forEach((m, i) => { if (!swapped[i]) setLabels(m, labels[i]); });
+  world.freezeAt(finalPose(sim));               // живой мир продолжается с места остановки
+  const sum = values.reduce((a, b) => a + b, 0);
+  resultEl.textContent = count > 1 ? `${values.join(' + ')} = ${sum}` : `${values[0]}`;
+  playback = null;
+  mode = 'live';
+  tracker.reset(performance.now());
+}
+
+// ---------- Главный цикл ----------
+let lastTime = performance.now();
+function frame(now) {
+  const dt = Math.max(0, Math.min((now - lastTime) / 1000, 0.05));
+  lastTime = now;
+  if (mode === 'live') {
+    world.step(dt, motion.gravity(now));
+    syncMeshes();
+    tracker.update(motion.dev(now), now);
+  } else {
+    playbackFrame(now);
+  }
+  view.render();
   requestAnimationFrame(frame);
 }
 
 // ---------- Датчики ----------
 let source = 'не запущен';
 let statusMsg = '';
-const feed = createShakeDetector((strength) => roll(strength));
-let samples = 0;
-const countedFeed = (x, y, z) => { samples++; feed(x, y, z); };
-
 let motionStarting = false;
-async function ensureMotion() {                    // безопасно вызывать много раз
+async function ensureMotion() {                 // безопасно вызывать много раз
   if (motionStarting) return;
   motionStarting = true;
-  source = (await startMotion(countedFeed, (s) => { statusMsg = s; })) || 'нет';
+  source = (await startMotion((x, y, z) => motion.feed(x, y, z), (s) => { statusMsg = s; })) || 'нет';
 }
-ensureMotion();                                    // Telegram-акселерометр стартует без жеста
+ensureMotion();                                 // Telegram-акселерометр стартует без жеста
 window.addEventListener('pointerdown', () => { goFullscreen(); ensureMotion(); }, { once: true });
-// ^ первое касание в любом месте: повторный запрос полного экрана и запуск датчика (нужно для iOS)
+// ^ первое касание: повторный запрос полного экрана и запуск датчика (нужно для iOS DeviceMotion)
 
 // ---------- Кнопки ----------
-document.getElementById('rollBtn').addEventListener('click', () => roll(0.4 + Math.random() * 0.5));
+document.getElementById('rollBtn').addEventListener('click', () => {
+  if (mode === 'live') tracker.force(performance.now());   // без тряски: сразу финальный подброс
+});
 document.getElementById('plus').addEventListener('click', () => {
-  if (!rolling && count < CONFIG.MAX_DICE) { count++; rebuildDice(); }
+  if (mode === 'live' && count < CONFIG.MAX_DICE) { count++; rebuild(); }
 });
 document.getElementById('minus').addEventListener('click', () => {
-  if (!rolling && count > 1) { count--; rebuildDice(); }
+  if (mode === 'live' && count > 1) { count--; rebuild(); }
 });
 
 // ---------- Диагностика ----------
 if (SHOW_DEBUG) {
   setInterval(() => {
-    const s = feed.stats;
+    const m = motion.info();
+    const g = motion.gravity().map(v => v.toFixed(0)).join(',');
     debugEl.textContent =
       `tg ${tg?.version ?? '-'} ${tg?.platform ?? '-'} fullscreen=${tg?.isFullscreen ?? '-'} ${fsError}\n` +
-      `sensor=${source} samples=${samples} ${statusMsg}\n` +
-      `|a|=${s.mag.toFixed(1)} dev=${s.dev.toFixed(1)} peak=${s.peak.toFixed(1)} shakes=${s.shakes}`;
+      `sensor=${source} samples=${m.samples} ${statusMsg}\n` +
+      `xyz=${m.raw.map(v => v.toFixed(1)).join(' ')} dev=${m.dev.toFixed(1)} sign=${m.sign > 0 ? '+' : '-'}${m.detected ? '' : '?'}\n` +
+      `mode=${mode}/${tracker.state} shakes=${tracker.shakes} g=[${g}]`;
   }, 250);
 }
 
-rebuildDice();
+rebuild();
+requestAnimationFrame(frame);

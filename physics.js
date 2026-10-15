@@ -1,11 +1,11 @@
+// Общие части физики: мир со стенами, тело кости, определение верхней грани.
 import * as CANNON from 'cannon-es';
 import { CONFIG, FACE_NORMALS } from './config.js';
 
-const { ARENA, GRAVITY, STEP_HZ, MAX_SECONDS, SETTLE_STEPS, SETTLE_SPEED } = CONFIG;
-const DT = 1 / STEP_HZ;
-const rnd = (a, b) => a + Math.random() * (b - a);
+const { ARENA, GRAVITY } = CONFIG;
+export const rnd = (a, b) => a + Math.random() * (b - a);
 
-function buildWorld() {
+export function buildWorld() {
   const world = new CANNON.World({ gravity: new CANNON.Vec3(0, GRAVITY, 0) });
   world.solver.iterations = 20;           // стабильнее покой кости на полу
   world.allowSleep = false;
@@ -31,89 +31,36 @@ function buildWorld() {
   return { world, dieMat: die };
 }
 
-function makeDie(dieMat, i, n, strength) {
+export function createDieBody(dieMat) {
   const h = CONFIG.DIE_SIZE / 2;
-  const body = new CANNON.Body({
+  return new CANNON.Body({
     mass: 1, material: dieMat,
     shape: new CANNON.Box(new CANNON.Vec3(h, h, h)),
     linearDamping: 0.05, angularDamping: 0.05,
   });
+}
 
-  // Старт: кости друг над другом (шаг по высоте 1.05 > размера кости) и повёрнуты только вокруг Y,
-  // поэтому пересечений в начале нет. Пример n=3: y = 1.8, 2.85, 3.9
-  const dx = n > 1 ? Math.min(1.25, (2 * ARENA.halfX - 1.2) / (n - 1)) : 0;
-  body.position.set((i - (n - 1) / 2) * dx, 1.8 + i * 1.05, ARENA.halfZ - 1 + rnd(-0.15, 0.15));
-  body.quaternion.setFromEuler(0, rnd(0, Math.PI * 2), 0);
-
-  // strength 0..1. Пример 0.5: скорость 6 ед/с, вращение до ±19 рад/с по каждой оси
-  const speed = 3 + 6 * strength;
-  const spin = 8 + 22 * strength;
-  body.velocity.set(rnd(-1.5, 1.5), rnd(-1, 0.5), -speed + rnd(-1, 1));   // к дальней стене
-  body.angularVelocity.set(rnd(-spin, spin), rnd(-spin, spin), rnd(-spin, spin));
-  return body;
+// Телепорт кости в позу p=[x,y,z], q=[x,y,z,w] без скорости.
+// previous*/interpolated* тоже обновляем, иначе интерполяция покажет старую позу.
+export function setBodyPose(body, p, q) {
+  body.position.set(p[0], p[1], p[2]);
+  body.previousPosition.set(p[0], p[1], p[2]);
+  body.interpolatedPosition.set(p[0], p[1], p[2]);
+  body.quaternion.set(q[0], q[1], q[2], q[3]);
+  body.previousQuaternion.set(q[0], q[1], q[2], q[3]);
+  body.interpolatedQuaternion.set(q[0], q[1], q[2], q[3]);
+  body.velocity.set(0, 0, 0);
+  body.angularVelocity.set(0, 0, 0);
+  body.force.set(0, 0, 0);
+  body.torque.set(0, 0, 0);
 }
 
 // Какая локальная грань смотрит вверх и насколько точно (up=1 — идеально плашмя)
-function topFace(body) {
+export function topFace(body) {
   let best = { face: 0, up: -2 };
   FACE_NORMALS.forEach((nrm, f) => {
     const w = body.quaternion.vmult(new CANNON.Vec3(nrm[0], nrm[1], nrm[2]));
     if (w.y > best.up) best = { face: f, up: w.y };
   });
   return best;
-}
-
-function runOnce(n, strength, strict) {
-  const { world, dieMat } = buildWorld();
-  const bodies = [];
-  const impacts = [];                      // [{step, v}] удары для тактильного отклика
-  let step = 0;
-
-  for (let i = 0; i < n; i++) {
-    const b = makeDie(dieMat, i, n, strength);
-    b.addEventListener('collide', (e) => {
-      const v = Math.abs(e.contact.getImpactVelocityAlongNormal());
-      if (v > 1.5) impacts.push({ step: step + 1, v });
-    });
-    world.addBody(b);
-    bodies.push(b);
-  }
-
-  const frames = [];                       // каждый элемент: Float32Array[n*7]
-  const record = () => {
-    const f = new Float32Array(n * 7);     // на кость: x,y,z, qx,qy,qz,qw
-    let moving = false;
-    bodies.forEach((b, i) => {
-      const p = b.position, q = b.quaternion;
-      f.set([p.x, p.y, p.z, q.x, q.y, q.z, q.w], i * 7);
-      if (b.velocity.length() > SETTLE_SPEED || b.angularVelocity.length() > SETTLE_SPEED) moving = true;
-    });
-    frames.push(f);
-    return moving;
-  };
-
-  record();                                // кадр 0 — стартовая поза
-  let calm = 0;
-  while (step < MAX_SECONDS * STEP_HZ) {
-    world.step(DT);                        // фиксированный шаг => результат не зависит от FPS
-    step++;
-    calm = record() ? 0 : calm + 1;
-    if (calm >= SETTLE_STEPS) break;
-  }
-
-  const tops = bodies.map(topFace);
-  if (strict && tops.some(t => t.up < 0.985)) return null;   // кость «повисла» на стене/другой кости
-
-  // Плоский массив: shape [steps, n, 7]. Пример: 3.1 с -> 373 шага, n=2 -> 5222 float ≈ 21 КБ
-  const flat = new Float32Array(frames.length * n * 7);
-  frames.forEach((f, k) => flat.set(f, k * n * 7));
-  return { n, frames: flat, steps: frames.length, impacts, tops: tops.map(t => t.face) };
-}
-
-export function simulateThrow(n, strength) {
-  for (let attempt = 0; attempt < 8; attempt++) {
-    const sim = runOnce(n, strength, true);
-    if (sim) return sim;
-  }
-  return runOnce(n, strength, false);      // крайне редкий запасной вариант
 }

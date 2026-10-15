@@ -29,3 +29,9 @@ export function poseAt(sim, meshes, t) {
   });
   return x < last;
 }
+
+// Поза последнего кадра записи: Float32Array длины n*7 (для world.freezeAt)
+export function finalPose(sim) {
+  const stride = sim.n * 7;
+  return sim.frames.subarray((sim.steps - 1) * stride, sim.steps * stride);
+}

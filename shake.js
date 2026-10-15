@@ -1,46 +1,66 @@
-// Детектор тряски: высокочастотный фильтр по каждой оси.
-// Почему не длина вектора: при боковом рывке 10 м/с² и гравитации 9.8 по Z длина |a| = 14 (отклонение 4.2),
-// а отклонение самого вектора от «покоя» = 10. Вектор в 2.4 раза чувствительнее.
-//   покой:            baseline≈(0,0,9.8), dev≈0.2-0.5
-//   ходьба:           dev ≈ 2-4
-//   лёгкая тряска:    dev ≈ 7-12
-//   сильная тряска:   dev ≈ 15-30
-export function createShakeDetector(onShake, {
-  threshold = 5,      // м/с² отклонения вектора от среднего
-  hitsNeeded = 3,     // пиков за окно (один пик = одно движение туда или обратно)
-  windowMs = 900,     // окно, за которое нужно набрать пики
-  cooldownMs = 1200,  // пауза после срабатывания
-  alpha = 0.05,       // скорость обновления среднего (~0.4 с при 50 Гц)
-} = {}) {
-  let bx = null, by = 0, bz = 0;           // скользящее среднее вектора (≈ гравитация)
-  let armed = true;                        // пик считается заново только после спада
-  let hits = [];                           // [{t, dev}]
-  let lastShake = -Infinity;
+// Автомат тряски. Состояния: idle -> shaking -> (бросок) -> idle.
+//   start:   3 пика (локальных максимума) отклонения > START_DEV за START_WINDOW_MS,
+//            либо отклонение выше порога непрерывно SUSTAIN_MS (круговая тряска без провалов)
+//   release: рука остановилась (отклонение < CALM_DEV дольше CALM_MS), но не раньше MIN_SHAKE_MS;
+//            либо тряска дольше MAX_SHAKE_MS; либо нажали кнопку.
+// Пик = максимум, после которого отклонение упало ниже 65% от него. Следующий пик начинается,
+// когда отклонение выросло на 35% над минимумом («впадиной»). Так считаются и тряска вдоль одной оси
+// (впадины глубокие), и тряска по двум осям со сдвигом фаз (впадины мелкие, но есть).
+// Пример: тряска 1.4 с, затем пауза -> release через 220 мс после остановки.
+import { CONFIG } from './config.js';
 
-  function feed(x, y, z) {
-    const now = performance.now();
-    if (bx === null) { bx = x; by = y; bz = z; }
-    const dev = Math.hypot(x - bx, y - by, z - bz);
-    bx += (x - bx) * alpha; by += (y - by) * alpha; bz += (z - bz) * alpha;
+const S = CONFIG.SHAKE;
 
-    feed.stats.dev = dev;
-    feed.stats.mag = Math.hypot(x, y, z);
-    feed.stats.peak = Math.max(feed.stats.peak * 0.97, dev);
+export function createShakeTracker({ onStart, onRelease }) {
+  let state = 'idle', hits = [], startAt = 0, calmSince = null, cooldownUntil = 0;
+  let inPeak = false, peakVal = 0, valley = 0, aboveSince = null;
+  const api = { shakes: 0, peak: 0, get state() { return state; } };
 
-    if (dev < threshold * 0.5) armed = true;           // гистерезис: спад ниже половины порога
-    if (dev < threshold || !armed) return;
-    armed = false;                                      // фронт: считаем один пик на одно движение
+  function clearPeaks() { hits = []; inPeak = false; peakVal = 0; valley = 0; aboveSince = null; }
 
-    hits = hits.filter(h => now - h.t <= windowMs);
-    hits.push({ t: now, dev });
-    if (hits.length >= hitsNeeded && now - lastShake > cooldownMs) {
-      const peak = Math.max(...hits.map(h => h.dev));
-      lastShake = now; hits = [];
-      feed.stats.shakes++;
-      // сила броска: даже лёгкая тряска даёт нормальный бросок (0.3), сильная — максимум (1.0)
-      onShake(0.3 + 0.7 * Math.min(1, Math.max(0, (peak - threshold) / 15)));
-    }
+  function begin(now) {
+    state = 'shaking'; startAt = now; calmSince = null; clearPeaks();
+    api.shakes++;
+    onStart();
   }
-  feed.stats = { dev: 0, mag: 0, peak: 0, shakes: 0 };
-  return feed;
+  function end(reason, now) {
+    state = 'idle'; clearPeaks(); cooldownUntil = now + S.COOLDOWN_MS;
+    onRelease(reason);
+  }
+
+  api.update = (dev, now) => {
+    api.peak = Math.max(api.peak * 0.97, dev);
+
+    if (state === 'idle') {
+      if (now < cooldownUntil) { clearPeaks(); return; }
+
+      // непрерывное отклонение выше порога
+      if (dev >= S.START_DEV) { if (aboveSince === null) aboveSince = now; } else aboveSince = null;
+      if (aboveSince !== null && now - aboveSince >= S.SUSTAIN_MS) { begin(now); return; }
+
+      // поиск пиков
+      if (inPeak) {
+        if (dev > peakVal) peakVal = dev;
+        else if (dev < peakVal * 0.65) {              // пик завершён
+          inPeak = false; valley = dev;
+          hits = hits.filter(t => now - t <= S.START_WINDOW_MS);
+          hits.push(now);
+          if (hits.length >= S.START_HITS) begin(now);
+        }
+      } else {
+        valley = Math.min(valley, dev);
+        if (dev >= S.START_DEV && dev > valley * 1.35 + 0.5) { inPeak = true; peakVal = dev; }
+      }
+      return;
+    }
+
+    const dur = now - startAt;
+    if (dev < S.CALM_DEV) { if (calmSince === null) calmSince = now; } else calmSince = null;
+    if (dur >= S.MAX_SHAKE_MS) end('timeout', now);
+    else if (dur >= S.MIN_SHAKE_MS && calmSince !== null && now - calmSince >= S.CALM_MS) end('calm', now);
+  };
+
+  api.force = (now) => { if (state === 'idle') begin(now); end('button', now); };
+  api.reset = (now) => { state = 'idle'; clearPeaks(); cooldownUntil = now + S.COOLDOWN_MS; };
+  return api;
 }
