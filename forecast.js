@@ -15,8 +15,8 @@ const DT = 1 / STEP_HZ;
 // Пример: лежит, v=(0.3,0,0.1) -> vy = 8.5..10.5 ед/с, подскок до y ≈ 0.5 + 8.5²/70 ≈ 1.5
 //         летит, y=1.3, w=1 рад/с, цель 18 рад/с, RAMP=24 -> +0.7 рад/с на шаг, 0.2 с до полной
 // Возвращает { kicked, spin }: spin = null | {target:[wx,wy,wz], at:'rise'|'ramp'}
-const randSpin = () => {
-  const s = rnd(KICK.SPIN_MIN, KICK.SPIN_MAX);
+const randSpin = (lo = KICK.SPIN_MIN, hi = KICK.SPIN_MAX) => {
+  const s = rnd(lo, hi);
   const a = rnd(0, Math.PI * 2), c = rnd(-1, 1), r = Math.sqrt(1 - c * c);
   return [s * r * Math.cos(a), s * c, s * r * Math.sin(a)];   // случайная ось, |w| = s
 };
@@ -38,7 +38,9 @@ function applyKick(body) {
     }
     return { kicked: true, spin: null };
   }
-  if (w.length() < KICK.MIN_SPIN) return { kicked: false, spin: { target: randSpin(), at: 'ramp', left: KICK.RAMP_STEPS } };
+  // Летящая кость: скорость не трогаем. Разгоняем вращение только если она почти не вращается;
+  // кость, уже кувыркающаяся (2..10 рад/с), остаётся как есть, без «магической» раскрутки.
+  if (w.length() < KICK.RAMP_BELOW) return { kicked: false, spin: { target: randSpin(KICK.RAMP_SPIN_MIN, KICK.RAMP_SPIN_MAX), at: 'ramp', left: KICK.RAMP_STEPS } };
   return { kicked: false, spin: null };
 }
 
@@ -66,7 +68,7 @@ function minDistToOthers(bodies, i) {
   return m;
 }
 
-function runOnce(snapshot, strict) {
+function runOnce(snapshot, strict, attempt = 0) {
   const n = snapshot.length;
   const { world, dieMat } = buildWorld();              // обычная гравитация вниз
   const bodies = [];
@@ -82,12 +84,16 @@ function runOnce(snapshot, strict) {
     setBodyPose(b, s.p, s.q);
     b.velocity.set(s.v[0], s.v[1], s.v[2]);
     b.angularVelocity.set(s.w[0], s.w[1], s.w[2]);
+    if (attempt > 0) {                                  // повторная попытка: крошечное возмущение, чтобы исход отличался
+      b.velocity.x += rnd(-0.4, 0.4); b.velocity.z += rnd(-0.4, 0.4);
+      b.angularVelocity.x += rnd(-0.8, 0.8); b.angularVelocity.y += rnd(-0.8, 0.8); b.angularVelocity.z += rnd(-0.8, 0.8);
+    }
     const k = applyKick(b);
     kicked[i] = k.kicked;
     pendingSpin[i] = k.spin;
     stats.kicked += k.kicked ? 1 : 0; stats.ramped += k.spin?.at === 'ramp' ? 1 : 0;
     // Кость, которая к моменту броска уже кувыркалась (тряска), зрителю уже «непонятна»: угол считаем набранным
-    if (b.angularVelocity.length() > SWAP.MIN_SPIN) rotAcc[i] = 99;
+    if (b.angularVelocity.length() > SWAP.PRESET_SPIN) rotAcc[i] = 99;
     b.addEventListener('collide', (e) => {
       const v = Math.abs(e.contact.getImpactVelocityAlongNormal());
       if (v > 1.5) impacts.push({ step: step + 1, v });
@@ -135,8 +141,7 @@ function runOnce(snapshot, strict) {
         w.set(w.x + (t[0] - w.x) * k, w.y + (t[1] - w.y) * k, w.z + (t[2] - w.z) * k);
         if (--ps.left <= 0) pendingSpin[i] = null;
       } else if ((b.position.y > KICK.SPIN_Y && minDistToOthers(bodies, i) > KICK.SPIN_CLEAR) || step > KICK.SPIN_MAX_STEPS) {
-        w.set(ps.target[0], ps.target[1], ps.target[2]);   // лежавшая кость: вращение после подъёма
-        pendingSpin[i] = null;
+        ps.at = 'ramp'; ps.left = KICK.RISE_RAMP_STEPS;   // лежавшая кость: вращение нарастает плавно после подъёма
       }
     });
     calm = record() ? 0 : calm + 1;
@@ -162,8 +167,8 @@ function runOnce(snapshot, strict) {
 
 export function forecastRoll(snapshot) {
   for (let attempt = 0; attempt < 6; attempt++) {
-    const sim = runOnce(snapshot, true);
+    const sim = runOnce(snapshot, true, attempt);
     if (sim) return sim;
   }
-  return runOnce(snapshot, false);                      // крайне редкий запасной вариант
+  return runOnce(snapshot, false, 6);                      // крайне редкий запасной вариант
 }

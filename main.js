@@ -81,6 +81,8 @@ function rebuild() {
 
 // ---------- Состояние: live (поднос) -> rolling (проигрыш записанного броска) -> live ----------
 let mode = 'live';
+const BUILD = 4;                                // номер сборки: виден в диагностике, чтобы понимать, какая версия открыта
+const lastThrow = { fc: 0, maxDt: 0, info: '-' };   // данные последнего броска для диагностики
 let playback = null;
 let pendingRoll = null;        // значения запрашиваем в начале тряски, к броску они уже готовы
 
@@ -100,7 +102,11 @@ async function handleRelease() {
 
   let sim;
   try {
+    const tf = performance.now();
     sim = forecastRoll(world.snapshot());       // 20-60 мс: весь полёт считается заранее
+    lastThrow.fc = performance.now() - tf;
+    lastThrow.maxDt = 0;
+    lastThrow.info = `n=${count} kick=${sim.stats.kicked} ramp=${sim.stats.ramped} swap=${sim.swapKind.map(k => k[0]).join('')} dur=${(sim.steps / CONFIG.STEP_HZ).toFixed(1)}s`;
   } catch (e) {
     console.error(e);
     resultEl.textContent = 'Ошибка физики';
@@ -126,18 +132,19 @@ async function handleRelease() {
     swapped: dice.map(() => false),
     impactIdx: 0,
     pt: 0,                                      // собственные часы записи, секунды
-    last: performance.now(),
+    started: false,
   };
 }
 
-function playbackFrame(now) {
+function playbackFrame(now, frameDt) {
   if (!playback) return;                        // ждём значения (сервер)
   const { sim, labels, swapped } = playback;
-  // Часы записи идут не быстрее 2 кадров за раз: если кадр завис на 100 мс, кости не «телепортируются»,
-  // а запись просто чуть отстаёт от реального времени. Пример: подвисание 120 мс -> шаг 0.034 с вместо 0.12 с.
-  const dt = Math.max(0, Math.min((now - playback.last) / 1000, CONFIG.PLAYBACK_MAX_DT));
-  playback.last = now;
-  playback.pt += dt;
+  // Часы записи ведём по тем же rAF-кадрам, что и всё остальное (frameDt), а не по performance.now():
+  // иначе первый шаг получается нулевым (расчёт траектории съедает время) и кости замирают на кадр.
+  // Первый кадр: ровно один номинальный шаг 1/60 с, без учёта задержки на расчёт.
+  // Дальше: не быстрее 2 кадров за раз (подвисание 120 мс -> шаг 0.034 с вместо 0.12 с).
+  playback.pt += playback.started ? Math.min(frameDt, CONFIG.PLAYBACK_MAX_DT) : 1 / 60;
+  playback.started = true;
   const t = playback.pt;
   const going = poseAt(sim, dice, t);
   const step = t * CONFIG.STEP_HZ;
@@ -168,6 +175,7 @@ function finishRoll() {
 // ---------- Главный цикл ----------
 let lastTime = performance.now();
 function frame(now) {
+  if (mode === 'rolling') lastThrow.maxDt = Math.max(lastThrow.maxDt, now - lastTime);   // реальная длина кадра, мс
   const dt = Math.max(0, Math.min((now - lastTime) / 1000, 0.05));
   lastTime = now;
   if (mode === 'live') {
@@ -175,7 +183,7 @@ function frame(now) {
     syncMeshes();
     tracker.update(motion.dev(now), now);
   } else {
-    playbackFrame(now);
+    playbackFrame(now, dt);
   }
   view.render();
   requestAnimationFrame(frame);
@@ -214,7 +222,8 @@ if (SHOW_DEBUG) {
       `tg ${tg?.version ?? '-'} ${tg?.platform ?? '-'} fullscreen=${tg?.isFullscreen ?? '-'} ${fsError}\n` +
       `sensor=${source} samples=${m.samples} ${statusMsg}\n` +
       `xyz=${m.raw.map(v => v.toFixed(1)).join(' ')} dev=${m.dev.toFixed(1)} sign=${m.sign > 0 ? '+' : '-'}${m.detected ? '' : '?'}\n` +
-      `mode=${mode}/${tracker.state} shakes=${tracker.shakes} g=[${g}]`;
+      `mode=${mode}/${tracker.state} shakes=${tracker.shakes} g=[${g}]\n` +
+      `build ${BUILD}; бросок: расчёт ${lastThrow.fc.toFixed(0)} мс, макс. кадр ${lastThrow.maxDt.toFixed(0)} мс, ${lastThrow.info}`;
   }, 250);
 }
 
