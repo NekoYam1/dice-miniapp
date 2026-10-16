@@ -8,26 +8,38 @@ import { buildWorld, createDieBody, setBodyPose, topFace, rnd } from './physics.
 const { STEP_HZ, MAX_SECONDS, SETTLE_STEPS, SETTLE_SPEED, KICK, SWAP } = CONFIG;
 const DT = 1 / STEP_HZ;
 
-// Если кость почти стоит, даём ей финальный подброс: так у каждого броска есть видимый полёт,
-// и подмена чисел на гранях происходит, пока кость крутится в воздухе.
-// Подброс сразу, а вращение включаем позже (когда центр выше KICK.SPIN_Y): иначе вращающийся куб
-// ещё касается пола, угол бьёт в стол и «съедает» вращение.
-// Пример: v=(0.3,0,0.1) -> vy = 8.5..10.5 ед/с, подскок до y ≈ 0.5 + 8.5²/70 ≈ 1.5
-// Возвращает вектор отложенного вращения [wx,wy,wz] или null.
+// Кость либо ЛЕЖИТ на столе, либо ЛЕТИТ (её подбросила тряска). С ними обращаемся по-разному:
+//   лежит  -> финальный подброс, чтобы у броска был видимый полёт (там и меняются числа на гранях);
+//   летит  -> скорость не трогаем совсем (никаких скачков). Если она почти не вращается, вращение
+//            нарастает плавно за KICK.RAMP_STEPS шагов, как будто кость задел удар.
+// Пример: лежит, v=(0.3,0,0.1) -> vy = 8.5..10.5 ед/с, подскок до y ≈ 0.5 + 8.5²/70 ≈ 1.5
+//         летит, y=1.3, w=1 рад/с, цель 18 рад/с, RAMP=24 -> +0.7 рад/с на шаг, 0.2 с до полной
+// Возвращает { kicked, spin }: spin = null | {target:[wx,wy,wz], at:'rise'|'ramp'}
+const randSpin = () => {
+  const s = rnd(KICK.SPIN_MIN, KICK.SPIN_MAX);
+  const a = rnd(0, Math.PI * 2), c = rnd(-1, 1), r = Math.sqrt(1 - c * c);
+  return [s * r * Math.cos(a), s * c, s * r * Math.sin(a)];   // случайная ось, |w| = s
+};
+
 function applyKick(body) {
   const v = body.velocity, w = body.angularVelocity;
-  if (v.length() < KICK.MIN_SPEED) {
-    v.x += rnd(-KICK.SIDE, KICK.SIDE);
-    v.z += rnd(-KICK.SIDE, KICK.SIDE);
+  // Кость, прислонённая к стенке или другой кости (центр выше 0.75, но почти не движется), тоже «лежит»
+  const still = v.length() < 1 && w.length() < 1;
+  const resting = (body.position.y < KICK.REST_Y && Math.abs(v.y) < KICK.REST_VY) || still;
+  if (resting) {
+    if (v.length() < KICK.MIN_SPEED) {
+      v.x += rnd(-KICK.SIDE, KICK.SIDE);
+      v.z += rnd(-KICK.SIDE, KICK.SIDE);
+    }
     v.y = Math.max(v.y, KICK.UP_MIN + rnd(0, KICK.UP_RAND));
+    if (w.length() < KICK.MIN_SPIN) {
+      w.set(0, 0, 0);
+      return { kicked: true, spin: { target: randSpin(), at: 'rise' } };   // вращение включим, когда кость поднимется
+    }
+    return { kicked: true, spin: null };
   }
-  if (w.length() < KICK.MIN_SPIN) {
-    const s = rnd(KICK.SPIN_MIN, KICK.SPIN_MAX);
-    const a = rnd(0, Math.PI * 2), c = rnd(-1, 1), r = Math.sqrt(1 - c * c);
-    w.set(0, 0, 0);
-    return [s * r * Math.cos(a), s * c, s * r * Math.sin(a)];   // случайная ось, |w| = s
-  }
-  return null;
+  if (w.length() < KICK.MIN_SPIN) return { kicked: false, spin: { target: randSpin(), at: 'ramp', left: KICK.RAMP_STEPS } };
+  return { kicked: false, spin: null };
 }
 
 // Подброшенные кости, лежавшие рядом, расталкиваем: вращающийся куб занимает сферу радиусом ≈0.87,
@@ -63,14 +75,17 @@ function runOnce(snapshot, strict) {
   const kicked = new Array(n).fill(false);
   const pendingSpin = new Array(n).fill(null);          // отложенное вращение на кость
   const rotAcc = new Array(n).fill(0);                  // накопленный угол поворота кости, рад
+  const stats = { kicked: 0, ramped: 0 };               // для диагностики
 
   snapshot.forEach((s, i) => {
     const b = createDieBody(dieMat);
     setBodyPose(b, s.p, s.q);
     b.velocity.set(s.v[0], s.v[1], s.v[2]);
     b.angularVelocity.set(s.w[0], s.w[1], s.w[2]);
-    kicked[i] = b.velocity.length() < KICK.MIN_SPEED;
-    pendingSpin[i] = applyKick(b);
+    const k = applyKick(b);
+    kicked[i] = k.kicked;
+    pendingSpin[i] = k.spin;
+    stats.kicked += k.kicked ? 1 : 0; stats.ramped += k.spin?.at === 'ramp' ? 1 : 0;
     // Кость, которая к моменту броска уже кувыркалась (тряска), зрителю уже «непонятна»: угол считаем набранным
     if (b.angularVelocity.length() > SWAP.MIN_SPIN) rotAcc[i] = 99;
     b.addEventListener('collide', (e) => {
@@ -111,9 +126,16 @@ function runOnce(snapshot, strict) {
   while (step < MAX_SECONDS * STEP_HZ) {
     world.step(DT);                                     // фиксированный шаг => результат не зависит от FPS
     step++;
-    bodies.forEach((b, i) => {                          // включаем отложенное вращение, когда кость поднялась
-      if (pendingSpin[i] && ((b.position.y > KICK.SPIN_Y && minDistToOthers(bodies, i) > KICK.SPIN_CLEAR) || step > KICK.SPIN_MAX_STEPS)) {
-        b.angularVelocity.set(pendingSpin[i][0], pendingSpin[i][1], pendingSpin[i][2]);
+    bodies.forEach((b, i) => {
+      const ps = pendingSpin[i];
+      if (!ps) return;
+      const w = b.angularVelocity;
+      if (ps.at === 'ramp') {                           // плавный разгон вращения у летящей кости
+        const t = ps.target, k = 1 / ps.left;
+        w.set(w.x + (t[0] - w.x) * k, w.y + (t[1] - w.y) * k, w.z + (t[2] - w.z) * k);
+        if (--ps.left <= 0) pendingSpin[i] = null;
+      } else if ((b.position.y > KICK.SPIN_Y && minDistToOthers(bodies, i) > KICK.SPIN_CLEAR) || step > KICK.SPIN_MAX_STEPS) {
+        w.set(ps.target[0], ps.target[1], ps.target[2]);   // лежавшая кость: вращение после подъёма
         pendingSpin[i] = null;
       }
     });
@@ -135,7 +157,7 @@ function runOnce(snapshot, strict) {
   // Плоский массив shape [steps, n, 7]. Пример: 2.2 с -> 264 шага, n=2 -> 3696 float ≈ 15 КБ
   const flat = new Float32Array(frames.length * n * 7);
   frames.forEach((f, k) => flat.set(f, k * n * 7));
-  return { n, frames: flat, steps: frames.length, impacts, tops: tops.map(t => t.face), swapSteps, swapKind };
+  return { n, frames: flat, steps: frames.length, impacts, tops: tops.map(t => t.face), swapSteps, swapKind, stats };
 }
 
 export function forecastRoll(snapshot) {

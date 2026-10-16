@@ -125,14 +125,20 @@ async function handleRelease() {
     sim, values, labels,
     swapped: dice.map(() => false),
     impactIdx: 0,
-    t0: performance.now(),
+    pt: 0,                                      // собственные часы записи, секунды
+    last: performance.now(),
   };
 }
 
 function playbackFrame(now) {
   if (!playback) return;                        // ждём значения (сервер)
   const { sim, labels, swapped } = playback;
-  const t = Math.max(0, (now - playback.t0) / 1000);
+  // Часы записи идут не быстрее 2 кадров за раз: если кадр завис на 100 мс, кости не «телепортируются»,
+  // а запись просто чуть отстаёт от реального времени. Пример: подвисание 120 мс -> шаг 0.034 с вместо 0.12 с.
+  const dt = Math.max(0, Math.min((now - playback.last) / 1000, CONFIG.PLAYBACK_MAX_DT));
+  playback.last = now;
+  playback.pt += dt;
+  const t = playback.pt;
   const going = poseAt(sim, dice, t);
   const step = t * CONFIG.STEP_HZ;
 
